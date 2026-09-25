@@ -4,22 +4,27 @@ mod data_id;
 mod fetchable;
 mod item;
 mod pending;
+mod pull;
 
 pub use data_id::DataId;
 pub(crate) use fetchable::DataPolicy;
 use fetchable::ReceiptProofPolicy;
 pub(crate) use item::{AssembledDataError, SpiceData, VerifiedCodedPart};
 use item::{FetchItem, PartInsertResult};
-use near_chain::Error;
+use near_async::time::Instant;
+use near_chain::{Block, Error};
 use near_epoch_manager::EpochManagerAdapter;
 use near_epoch_manager::shard_tracker::ShardTracker;
 use near_primitives::block_header::BlockHeader;
+use near_primitives::hash::CryptoHash;
 use near_primitives::reed_solomon::ReedSolomonEncoderCache;
 use near_primitives::spice::partial_data::{SpiceDataCommitment, SpiceDataPart};
-use near_primitives::types::{AccountId, BlockHeight};
+use near_primitives::types::{AccountId, BlockHeight, SpiceChunkId};
 use near_store::adapter::chain_store::ChainStoreAdapter;
 pub(crate) use pending::PendingPartialData;
+pub(crate) use pull::{PullConfig, PullRequest, rotated_source_index};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::mem::replace;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -40,6 +45,8 @@ pub(crate) enum SenderFault {
     InvalidMerkleProof,
     #[error("sender already backed another commitment")]
     ConflictingCommitment,
+    #[error("sender is not a producer of the item")]
+    NotAProducer,
 }
 
 /// Outcome of accepting parts for an item.
@@ -87,31 +94,53 @@ impl DataPolicy for Policies {
     fn is_done(&self, id: &DataId) -> Result<bool, Error> {
         self.for_id(id).is_done(id)
     }
+
+    fn producers(&self, id: &DataId) -> Result<Vec<AccountId>, Error> {
+        self.for_id(id).producers(id)
+    }
+
+    fn opening_chunks(&self, id: &DataId) -> Vec<SpiceChunkId> {
+        self.for_id(id).opening_chunks(id)
+    }
 }
 
-/// Owns the per-item fetch lifecycle: what this node still needs, the parts received so
-/// far and who sent them, and when an item stops being relevant.
+/// Owns the per-item fetch state: what this node still needs, the parts received so far
+/// and who sent them, the pull requests outstanding, and when an item stops being
+/// relevant.
 // TODO(spice-data-distribution): only receipt proofs route here; witnesses still live
 // on the old actor path (#16275).
-pub(crate) struct SpiceDataManager {
+pub(crate) struct SpiceDataManager<P: DataPolicy = Policies> {
+    pull_config: PullConfig,
     encoders: ReedSolomonEncoderCache,
-    policies: Policies,
+    chain_store: ChainStoreAdapter,
+    policies: P,
     /// All tracked items, in any state.
     items: HashMap<DataId, FetchItem>,
     /// Ids of tracked items, indexed by their block's height as captured when first tracked
     items_by_height: BTreeMap<BlockHeight, Vec<DataId>>,
     /// Highest final execution head reported; `None` until the first report.
     final_execution_head: Option<BlockHeight>,
+    /// Chunks certified by the blocks tracked so far, with their block's height; pruned with
+    /// the items at the final execution head.
+    certified: HashMap<SpiceChunkId, BlockHeight>,
 }
 
-impl SpiceDataManager {
-    pub(crate) fn new(data_parts_ratio: f64, policies: Policies) -> Self {
+impl<P: DataPolicy> SpiceDataManager<P> {
+    pub(crate) fn new(
+        pull_config: PullConfig,
+        data_parts_ratio: f64,
+        chain_store: ChainStoreAdapter,
+        policies: P,
+    ) -> Self {
         Self {
+            pull_config,
             encoders: ReedSolomonEncoderCache::new(data_parts_ratio),
+            chain_store,
             policies,
             items: HashMap::new(),
             items_by_height: BTreeMap::new(),
             final_execution_head: None,
+            certified: HashMap::new(),
         }
     }
 
@@ -121,28 +150,115 @@ impl SpiceDataManager {
         self.items.contains_key(id)
     }
 
-    /// Starts tracking every item this node needs from `block` and doesn't already have or track. Idempotent.
-    pub(crate) fn track_block(&mut self, block: &BlockHeader) -> Result<(), Error> {
+    /// Records the chunks `block` certifies, on the manager and on the tracked items waiting
+    /// on them, then starts tracking every item this node needs from `block` and doesn't
+    /// already have or track. Idempotent.
+    pub(crate) fn track_block(&mut self, block: &Block) -> Result<(), Error> {
+        self.open_certified(block)?;
+        self.track_needed(block.header())
+    }
+
+    /// Records the chunks `block` certifies, on the manager and on the tracked items waiting
+    /// on them.
+    fn open_certified(&mut self, block: &Block) -> Result<(), Error> {
+        let mut certified = Vec::new();
+        for (chunk_id, _) in block.spice_core_statements().iter_execution_results() {
+            let height = self.chain_store.get_block_header(&chunk_id.block_hash)?.height();
+            certified.push((height, chunk_id));
+        }
+        for (height, chunk_id) in certified {
+            for id in self.items_by_height.get(&height).into_iter().flatten() {
+                let item = self.items.get_mut(id).expect("index entry names a tracked item");
+                item.uncertified_opening_chunks.remove(chunk_id);
+            }
+            self.certified.insert(chunk_id.clone(), height);
+        }
+        Ok(())
+    }
+
+    /// Starts tracking every item this node needs from `block` and doesn't already have or
+    /// track.
+    fn track_needed(&mut self, block: &BlockHeader) -> Result<(), Error> {
         let height = block.height();
         // The chain is past the block, so its data can never be applied.
         if self.final_execution_head.is_some_and(|head| height <= head) {
             return Ok(());
         }
+        let mut new_ids = Vec::new();
         for id in self.policies.needed_ids(block)? {
-            if self.items.contains_key(&id) || self.policies.is_done(&id)? {
-                continue;
+            if !self.items.contains_key(&id) && !self.policies.is_done(&id)? {
+                new_ids.push(id);
             }
+        }
+        if new_ids.is_empty() {
+            return Ok(());
+        }
+        let mut resolved = Vec::with_capacity(new_ids.len());
+        for id in new_ids {
+            let producers = self.policies.producers(&id)?;
+            let opening_chunks = self
+                .policies
+                .opening_chunks(&id)
+                .into_iter()
+                .filter(|chunk_id| !self.certified.contains_key(chunk_id))
+                .collect();
+            resolved.push((id, producers, opening_chunks));
+        }
+        for (id, producers, opening_chunks) in resolved {
             self.items_by_height.entry(height).or_default().push(id.clone());
-            self.items.insert(id, FetchItem::new(height));
+            self.items.insert(id, FetchItem::new(height, producers, opening_chunks));
         }
         Ok(())
     }
 
+    /// The block was processed at `now`: expires the items at or below the final execution
+    /// head, records the chunks the block certifies, tracks the items needed from the block,
+    /// removes the delivered ones already in the store, and returns the requests for the
+    /// pullable rest, grouped by producer. A failed chain read is logged and skips only its
+    /// own step.
+    pub(crate) fn on_block_processed(
+        &mut self,
+        block_hash: &CryptoHash,
+        now: Instant,
+    ) -> Vec<PullRequest> {
+        match self.final_execution_head_height() {
+            Ok(height) => self.expire_at_or_below(height),
+            Err(err) => {
+                tracing::error!(target: "spice_data_distribution", ?err, "failed to read the final execution head");
+            }
+        }
+        match self.chain_store.get_block(block_hash) {
+            Ok(block) => {
+                if let Err(err) = self.open_certified(&block) {
+                    tracing::error!(target: "spice_data_distribution", ?err, ?block_hash, "failed to open the items the block certifies");
+                }
+                if let Err(err) = self.track_needed(block.header()) {
+                    tracing::error!(target: "spice_data_distribution", ?err, ?block_hash, "failed to track the block");
+                }
+            }
+            Err(err) => {
+                tracing::error!(target: "spice_data_distribution", ?err, ?block_hash, "failed to read the block");
+            }
+        }
+        self.remove_done_items();
+        self.pull_requests(now)
+    }
+
+    /// Height of the final execution head; the genesis height before the first one is recorded.
+    fn final_execution_head_height(&self) -> Result<BlockHeight, Error> {
+        match self.chain_store.spice_final_execution_head() {
+            Ok(head) => Ok(head.height),
+            Err(Error::DBNotFoundErr(_)) => Ok(self.chain_store.get_genesis_height()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Handles incoming parts: verifies every part's proof against the commitment before
     /// inserting any; a part failing its proof rejects the whole message and leaves the item
-    /// untouched, as does an empty message, one with more than `total_parts` parts, or one
-    /// repeating an ordinal. A decoding insert checks the decoded data against the committed
-    /// hash and the id, settles the commitment either way, and returns matching data.
+    /// untouched, as does an empty message, one with more than `total_parts` parts, one
+    /// repeating an ordinal, or one from a sender that is not a producer of the item. A verified message counts as the sender's answer to any request
+    /// outstanding to it. A decoding insert checks the decoded data against the committed hash
+    /// and the id, settles the commitment either way, and returns matching data.
     pub(crate) fn on_parts_received(
         &mut self,
         sender: &AccountId,
@@ -160,6 +276,9 @@ impl SpiceDataManager {
         let Some(item) = self.items.get_mut(id) else {
             return Ok(PartsOutcome::NotWanted);
         };
+        if !item.producers.iter().any(|(producer, _)| producer == sender) {
+            return Err(SenderFault::NotAProducer);
+        }
         let mut ordinals = HashSet::with_capacity(parts.len());
         let mut verified = Vec::with_capacity(parts.len());
         for SpiceDataPart { part_ord, part, merkle_proof } in parts {
@@ -171,10 +290,12 @@ impl SpiceDataManager {
                     .ok_or(SenderFault::InvalidMerkleProof)?;
             verified.push(part);
         }
+        item.note_pull_response(sender);
         let encoder = self.encoders.entry(total_parts);
         for part in verified {
             match item.insert_part(&encoder, id, sender, part) {
                 PartInsertResult::Decoded(data) => {
+                    item.delivered = true;
                     return Ok(PartsOutcome::Decoded(data));
                 }
                 PartInsertResult::Garbage(error) => {
@@ -190,16 +311,15 @@ impl SpiceDataManager {
         Ok(PartsOutcome::Collecting)
     }
 
-    /// The final execution head advanced: the chain is past every item at or below it,
-    /// so their data can no longer be applied. Removes them, and [`Self::track_block`] refuses
-    /// them from now on.
-    pub(crate) fn on_final_execution_head(&mut self, height: BlockHeight) {
+    /// Stops tracking items at or below `height`.
+    fn expire_at_or_below(&mut self, height: BlockHeight) {
         self.final_execution_head = self.final_execution_head.max(Some(height));
+        self.certified.retain(|_, chunk_height| *chunk_height > height);
         let Some(next_height) = height.checked_add(1) else {
             return;
         };
         let live = self.items_by_height.split_off(&next_height);
-        let expired = std::mem::replace(&mut self.items_by_height, live);
+        let expired = replace(&mut self.items_by_height, live);
         for (bucket_height, ids) in expired {
             for id in ids {
                 let item = self.items.get(&id).expect("index entry names a tracked item");
